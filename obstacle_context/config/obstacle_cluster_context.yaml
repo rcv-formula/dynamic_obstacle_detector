@@ -1,0 +1,67 @@
+obstacle_cluster_context_node:
+  ros__parameters:
+    scan_topic: "/scan"
+    odom_topic: "/odom"
+    imu_topic: "/imu/data"
+
+    processed_scan_topic: "/processed_scan"
+    output_topic: "/obstacle_clusters"
+    marker_topic: "/obstacle_cluster_markers"
+
+    # scan preprocessing
+    min_valid_range: 0.15
+    max_valid_range: 10.0
+
+    use_roi_filter: true
+    roi_angle_min_deg: -120.0
+    roi_angle_max_deg: 120.0
+
+    # clustering
+    # 12x12 cm obstacle 기준 초기값
+    cluster_range_jump: 0.20
+    min_cluster_points: 3
+    min_cluster_width: 0.04
+    max_cluster_width: 3.0
+
+    # tracking
+    association_distance: 0.60
+    min_observations: 5
+    track_timeout_sec: 0.50
+    track_history_size: 7
+
+    # motion classification hysteresis thresholds [m/s]
+    static_speed_threshold: 0.6
+
+    dynamic_speed_threshold: 0.8
+    static_confirm_count: 3
+    dynamic_confirm_count: 3
+
+    # wall-like static labeling
+    use_wall_static_label: true
+    wall_static_min_width: 1.0
+    wall_static_min_points: 10
+
+    # scan density based static rescue
+    use_scan_density_static_filter: true
+    scan_density_history_size: 7
+    scan_density_cell_size: 0.08
+    scan_density_min_weight: 300.0
+    scan_density_neighbor_cells: 1
+    scan_density_cluster_min_dense_points: 2
+
+    # IMU gate disabled while odom header timestamps are available.
+    use_imu_motion_gate: false
+    # imu_accel_gate_threshold: 3.0
+    # imu_yaw_rate_gate_threshold: 1.0
+    # imu_motion_gate_hold_sec: 0.25
+
+    # odom safety checks
+    max_odom_age_sec: 0.35
+    max_pose_jump_dist: 1.0
+    max_pose_jump_yaw_deg: 20.0
+    odom_history_sec: 2.0
+
+    # marker
+    marker_scale: 0.15
+    marker_text_scale: 0.18
+    marker_lifetime_sec: 0.2

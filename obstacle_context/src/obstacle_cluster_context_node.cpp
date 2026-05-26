@@ -88,6 +88,7 @@ public:
         rclcpp::SensorDataQoS());
 
     RCLCPP_INFO(this->get_logger(), "obstacle_cluster_context_node started");
+    RCLCPP_INFO(this->get_logger(), "use_sim_time: %s", use_sim_time_ ? "true" : "false");
     RCLCPP_INFO(this->get_logger(), "input_type: %s", input_type_.c_str());
     RCLCPP_INFO(this->get_logger(), "scan_topic: %s", scan_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "pointcloud_topic: %s", pointcloud_topic_.c_str());
@@ -102,6 +103,10 @@ public:
     RCLCPP_INFO(this->get_logger(), "marker_topic: %s", marker_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "dynamic_pointcloud_topic: %s", dynamic_pointcloud_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "static_pointcloud_topic: %s", static_pointcloud_topic_.c_str());
+    RCLCPP_INFO(
+      this->get_logger(),
+      "pointcloud_use_latest_tf: %s",
+      pointcloud_use_latest_tf_ ? "true" : "false");
   }
 
 private:
@@ -198,6 +203,7 @@ private:
     this->declare_parameter<std::string>("marker_topic", "/obstacle_cluster_markers");
     this->declare_parameter<std::string>("dynamic_pointcloud_topic", "/dynamic_pointcloud");
     this->declare_parameter<std::string>("static_pointcloud_topic", "/static_pointcloud");
+    this->declare_parameter<bool>("pointcloud_use_latest_tf", true);
 
     this->declare_parameter<double>("min_valid_range", 0.15);
     this->declare_parameter<double>("max_valid_range", 10.0);
@@ -249,6 +255,11 @@ private:
 
   void loadParameters()
   {
+    rclcpp::Parameter use_sim_time_param;
+    if (this->get_parameter("use_sim_time", use_sim_time_param)) {
+      use_sim_time_ = use_sim_time_param.as_bool();
+    }
+
     input_type_ = this->get_parameter("input_type").as_string();
     scan_topic_ = this->get_parameter("scan_topic").as_string();
     pointcloud_topic_ = this->get_parameter("pointcloud_topic").as_string();
@@ -262,6 +273,8 @@ private:
       this->get_parameter("dynamic_pointcloud_topic").as_string();
     static_pointcloud_topic_ =
       this->get_parameter("static_pointcloud_topic").as_string();
+    pointcloud_use_latest_tf_ =
+      this->get_parameter("pointcloud_use_latest_tf").as_bool();
 
     if (input_type_ != "laser_scan" && input_type_ != "pointcloud2") {
       RCLCPP_WARN(
@@ -943,6 +956,10 @@ private:
   {
     sensor_msgs::msg::PointCloud2 cloud;
     cloud.header = header;
+    if (pointcloud_use_latest_tf_) {
+      cloud.header.stamp.sec = 0;
+      cloud.header.stamp.nanosec = 0;
+    }
     cloud.height = 1;
     cloud.is_bigendian = false;
     cloud.is_dense = true;
@@ -989,6 +1006,10 @@ private:
   {
     sensor_msgs::msg::PointCloud2 cloud;
     cloud.header = header;
+    if (pointcloud_use_latest_tf_) {
+      cloud.header.stamp.sec = 0;
+      cloud.header.stamp.nanosec = 0;
+    }
     cloud.height = 1;
     cloud.is_bigendian = false;
     cloud.is_dense = true;
@@ -1907,6 +1928,8 @@ private:
   }
 
 private:
+  bool use_sim_time_ = false;
+
   std::string input_type_;
   std::string scan_topic_;
   std::string pointcloud_topic_;
@@ -1918,6 +1941,7 @@ private:
   std::string marker_topic_;
   std::string dynamic_pointcloud_topic_;
   std::string static_pointcloud_topic_;
+  bool pointcloud_use_latest_tf_;
 
   double min_valid_range_;
   double max_valid_range_;

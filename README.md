@@ -418,3 +418,22 @@ The previous obstacle centroid is transformed into the current LiDAR frame using
 Then, nearest-neighbor association connects current clusters with previous tracks.  
 The residual centroid displacement is used to estimate obstacle velocity.  
 Finally, static, dynamic, and unknown labels are determined using velocity thresholds, observation count, and hit-count based hysteresis.
+
+---
+
+## Dynamic PointCloud2 Output Fields
+
+The `/dynamic_pointcloud` topic publishes only points that belong to clusters classified as dynamic in the latest input frame.
+
+Each point contains the following fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `x` | `float32` | Point x position in the current sensor frame. |
+| `y` | `float32` | Point y position in the current sensor frame. |
+| `z` | `float32` | Point z position. For LaserScan input, this is `0.0`. |
+| `track_id` | `uint32` | Tracker ID of the dynamic cluster that contains this point. |
+| `relative_speed` | `float32` | Odom-compensated speed of the dynamic cluster. |
+| `relative_yaw` | `float32` | Bearing angle from the robot to the cluster center, computed as `atan2(center_y, center_x)`. |
+
+Points from the same dynamic cluster share the same `track_id`, `relative_speed`, and `relative_yaw`.

@@ -14,6 +14,7 @@
 
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/msg/point_field.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "nav_msgs/msg/odometry.hpp"
@@ -166,6 +167,19 @@ private:
   {
     double max_weight;
     int dense_point_count;
+  };
+
+  struct DynamicPointMetadata
+  {
+    uint32_t track_id;
+    float relative_speed;
+    float relative_yaw;
+  };
+
+  struct DynamicPoint
+  {
+    ScanPoint point;
+    DynamicPointMetadata metadata;
   };
 
   using DensityCell = std::pair<int, int>;
@@ -877,21 +891,29 @@ private:
     }
 
     std::vector<bool> dynamic_source_mask(mask_size, false);
+    std::vector<DynamicPointMetadata> dynamic_metadata(mask_size);
     const size_t cluster_count = std::min(valid_clusters.size(), clusters_msg.clusters.size());
 
     for (size_t i = 0; i < cluster_count; ++i) {
-      if (clusters_msg.clusters[i].motion_label != ObstacleCluster::DYNAMIC) {
+      const auto & cluster_msg = clusters_msg.clusters[i];
+      if (cluster_msg.motion_label != ObstacleCluster::DYNAMIC) {
         continue;
       }
+
+      DynamicPointMetadata metadata;
+      metadata.track_id = cluster_msg.track_id;
+      metadata.relative_speed = cluster_msg.speed;
+      metadata.relative_yaw = std::atan2(cluster_msg.center_y, cluster_msg.center_x);
 
       for (const auto & point : valid_clusters[i]) {
         if (point.source_index < dynamic_source_mask.size()) {
           dynamic_source_mask[point.source_index] = true;
+          dynamic_metadata[point.source_index] = metadata;
         }
       }
     }
 
-    std::vector<ScanPoint> dynamic_points;
+    std::vector<DynamicPoint> dynamic_points;
     std::vector<ScanPoint> static_points;
     dynamic_points.reserve(points.size());
     static_points.reserve(points.size());
@@ -902,14 +924,63 @@ private:
         dynamic_source_mask[point.source_index];
 
       if (is_dynamic) {
-        dynamic_points.push_back(point);
+        DynamicPoint dynamic_point;
+        dynamic_point.point = point;
+        dynamic_point.metadata = dynamic_metadata[point.source_index];
+        dynamic_points.push_back(dynamic_point);
       } else {
         static_points.push_back(point);
       }
     }
 
-    dynamic_pointcloud_pub_->publish(makePointCloudMsg(header, dynamic_points));
+    dynamic_pointcloud_pub_->publish(makeDynamicPointCloudMsg(header, dynamic_points));
     static_pointcloud_pub_->publish(makePointCloudMsg(header, static_points));
+  }
+
+  sensor_msgs::msg::PointCloud2 makeDynamicPointCloudMsg(
+    const std_msgs::msg::Header & header,
+    const std::vector<DynamicPoint> & points) const
+  {
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header = header;
+    cloud.height = 1;
+    cloud.is_bigendian = false;
+    cloud.is_dense = true;
+
+    sensor_msgs::PointCloud2Modifier modifier(cloud);
+    modifier.setPointCloud2Fields(
+      6,
+      "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "track_id", 1, sensor_msgs::msg::PointField::UINT32,
+      "relative_speed", 1, sensor_msgs::msg::PointField::FLOAT32,
+      "relative_yaw", 1, sensor_msgs::msg::PointField::FLOAT32);
+    modifier.resize(points.size());
+
+    sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+    sensor_msgs::PointCloud2Iterator<uint32_t> iter_track_id(cloud, "track_id");
+    sensor_msgs::PointCloud2Iterator<float> iter_relative_speed(cloud, "relative_speed");
+    sensor_msgs::PointCloud2Iterator<float> iter_relative_yaw(cloud, "relative_yaw");
+
+    for (const auto & dynamic_point : points) {
+      *iter_x = static_cast<float>(dynamic_point.point.x);
+      *iter_y = static_cast<float>(dynamic_point.point.y);
+      *iter_z = static_cast<float>(dynamic_point.point.z);
+      *iter_track_id = dynamic_point.metadata.track_id;
+      *iter_relative_speed = dynamic_point.metadata.relative_speed;
+      *iter_relative_yaw = dynamic_point.metadata.relative_yaw;
+      ++iter_x;
+      ++iter_y;
+      ++iter_z;
+      ++iter_track_id;
+      ++iter_relative_speed;
+      ++iter_relative_yaw;
+    }
+
+    return cloud;
   }
 
   sensor_msgs::msg::PointCloud2 makePointCloudMsg(

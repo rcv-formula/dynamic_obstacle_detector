@@ -13,6 +13,8 @@
 #include "rclcpp/rclcpp.hpp"
 
 #include "sensor_msgs/msg/laser_scan.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "std_msgs/msg/header.hpp"
@@ -35,10 +37,17 @@ public:
     declareParameters();
     loadParameters();
 
-    scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-      scan_topic_,
-      rclcpp::SensorDataQoS(),
-      std::bind(&ObstacleClusterContextNode::scanCallback, this, std::placeholders::_1));
+    if (input_type_ == "pointcloud2") {
+      pointcloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+        pointcloud_topic_,
+        rclcpp::SensorDataQoS(),
+        std::bind(&ObstacleClusterContextNode::pointCloudCallback, this, std::placeholders::_1));
+    } else {
+      scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+        scan_topic_,
+        rclcpp::SensorDataQoS(),
+        std::bind(&ObstacleClusterContextNode::scanCallback, this, std::placeholders::_1));
+    }
 
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
       odom_topic_,
@@ -67,8 +76,20 @@ public:
         marker_topic_,
         rclcpp::QoS(1));
 
+    dynamic_pointcloud_pub_ =
+      this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        dynamic_pointcloud_topic_,
+        rclcpp::SensorDataQoS());
+
+    static_pointcloud_pub_ =
+      this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        static_pointcloud_topic_,
+        rclcpp::SensorDataQoS());
+
     RCLCPP_INFO(this->get_logger(), "obstacle_cluster_context_node started");
+    RCLCPP_INFO(this->get_logger(), "input_type: %s", input_type_.c_str());
     RCLCPP_INFO(this->get_logger(), "scan_topic: %s", scan_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "pointcloud_topic: %s", pointcloud_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "odom_topic: %s", odom_topic_.c_str());
     if (use_imu_motion_gate_) {
       RCLCPP_INFO(this->get_logger(), "imu_topic: %s", imu_topic_.c_str());
@@ -78,6 +99,8 @@ public:
     RCLCPP_INFO(this->get_logger(), "processed_scan_topic: %s", processed_scan_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "output_topic: %s", output_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "marker_topic: %s", marker_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "dynamic_pointcloud_topic: %s", dynamic_pointcloud_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "static_pointcloud_topic: %s", static_pointcloud_topic_.c_str());
   }
 
 private:
@@ -92,10 +115,12 @@ private:
   struct ScanPoint
   {
     size_t index;
+    size_t source_index;
     double range;
     double angle;
     double x;
     double y;
+    double z;
   };
 
   struct TrackState
@@ -148,13 +173,17 @@ private:
 
   void declareParameters()
   {
+    this->declare_parameter<std::string>("input_type", "laser_scan");
     this->declare_parameter<std::string>("scan_topic", "/scan");
+    this->declare_parameter<std::string>("pointcloud_topic", "/cloud");
     this->declare_parameter<std::string>("odom_topic", "/odom");
     this->declare_parameter<std::string>("imu_topic", "/imu/data");
 
     this->declare_parameter<std::string>("processed_scan_topic", "/processed_scan");
     this->declare_parameter<std::string>("output_topic", "/obstacle_clusters");
     this->declare_parameter<std::string>("marker_topic", "/obstacle_cluster_markers");
+    this->declare_parameter<std::string>("dynamic_pointcloud_topic", "/dynamic_pointcloud");
+    this->declare_parameter<std::string>("static_pointcloud_topic", "/static_pointcloud");
 
     this->declare_parameter<double>("min_valid_range", 0.15);
     this->declare_parameter<double>("max_valid_range", 10.0);
@@ -206,13 +235,27 @@ private:
 
   void loadParameters()
   {
+    input_type_ = this->get_parameter("input_type").as_string();
     scan_topic_ = this->get_parameter("scan_topic").as_string();
+    pointcloud_topic_ = this->get_parameter("pointcloud_topic").as_string();
     odom_topic_ = this->get_parameter("odom_topic").as_string();
     imu_topic_ = this->get_parameter("imu_topic").as_string();
 
     processed_scan_topic_ = this->get_parameter("processed_scan_topic").as_string();
     output_topic_ = this->get_parameter("output_topic").as_string();
     marker_topic_ = this->get_parameter("marker_topic").as_string();
+    dynamic_pointcloud_topic_ =
+      this->get_parameter("dynamic_pointcloud_topic").as_string();
+    static_pointcloud_topic_ =
+      this->get_parameter("static_pointcloud_topic").as_string();
+
+    if (input_type_ != "laser_scan" && input_type_ != "pointcloud2") {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "invalid input_type '%s'. falling back to 'laser_scan'",
+        input_type_.c_str());
+      input_type_ = "laser_scan";
+    }
 
     min_valid_range_ = this->get_parameter("min_valid_range").as_double();
     max_valid_range_ = this->get_parameter("max_valid_range").as_double();
@@ -370,8 +413,32 @@ private:
     sensor_msgs::msg::LaserScan processed_scan = makeProcessedScan(*scan);
     processed_scan_pub_->publish(processed_scan);
 
+    std::vector<ScanPoint> points = scanToPoints(processed_scan);
+    processPoints(
+      processed_scan.header,
+      points,
+      processed_scan.angle_increment,
+      processed_scan.ranges.size());
+  }
+
+  void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud)
+  {
+    const std::vector<ScanPoint> points = pointCloudToPoints(*cloud);
+    processPoints(
+      cloud->header,
+      points,
+      estimateAngleIncrement(points),
+      pointCloudPointCount(*cloud));
+  }
+
+  void processPoints(
+    const std_msgs::msg::Header & header,
+    const std::vector<ScanPoint> & points,
+    double angle_increment,
+    size_t source_point_count)
+  {
     OdomPose curr_pose;
-    const bool has_odom = getInterpolatedOdom(processed_scan.header.stamp, curr_pose);
+    const bool has_odom = getInterpolatedOdom(header.stamp, curr_pose);
 
     if (!has_odom) {
       RCLCPP_WARN_THROTTLE(
@@ -381,19 +448,19 @@ private:
         "no valid odom for scan time. clusters will be UNKNOWN");
     }
 
-    std::vector<ScanPoint> points = scanToPoints(processed_scan);
     std::vector<std::vector<ScanPoint>> clusters = makeClusters(points);
     const DensityGrid density_grid = has_odom ? makeScanDensityGrid(curr_pose) : DensityGrid{};
+    std::vector<std::vector<ScanPoint>> valid_clusters;
 
     obstacle_context_msgs::msg::ObstacleClusterArray out;
-    out.header = processed_scan.header;
+    out.header = header;
 
     for (const auto & cluster : clusters) {
       if (!isValidCluster(cluster)) {
         continue;
       }
 
-      auto msg = makeClusterMsg(processed_scan.header, cluster);
+      auto msg = makeClusterMsg(header, cluster);
       if (has_odom) {
         const DensityClusterStats density_stats =
           computeDensityClusterStats(cluster, density_grid);
@@ -402,24 +469,27 @@ private:
           static_cast<float>(density_stats.max_weight);
       }
       out.clusters.push_back(msg);
+      valid_clusters.push_back(cluster);
     }
 
     if (has_odom) {
       updateTracks(out, curr_pose);
       pushScanDensityHistory(
         points,
-        processed_scan.header.stamp,
+        header.stamp,
         curr_pose,
-        processed_scan.angle_increment);
+        angle_increment);
     } else {
       setAllClustersUnknown(out);
-      removeOldTracks(processed_scan.header.stamp);
+      removeOldTracks(header.stamp);
     }
 
     cluster_pub_->publish(out);
 
     auto marker_array = makeMarkerArray(out);
     marker_pub_->publish(marker_array);
+
+    publishSegmentedPointClouds(header, points, valid_clusters, out, source_point_count);
   }
 
   sensor_msgs::msg::LaserScan makeProcessedScan(
@@ -478,15 +548,157 @@ private:
 
       ScanPoint p;
       p.index = i;
+      p.source_index = i;
       p.range = range;
       p.angle = angle;
       p.x = range * std::cos(angle);
       p.y = range * std::sin(angle);
+      p.z = 0.0;
 
       points.push_back(p);
     }
 
     return points;
+  }
+
+  std::vector<ScanPoint> pointCloudToPoints(
+    const sensor_msgs::msg::PointCloud2 & cloud)
+  {
+    std::vector<ScanPoint> points;
+    points.reserve(pointCloudPointCount(cloud));
+
+    if (!hasPointCloudField(cloud, "x") || !hasPointCloudField(cloud, "y")) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        1000,
+        "PointCloud2 input must contain x and y fields");
+      return points;
+    }
+
+    const bool has_z = hasPointCloudField(cloud, "z");
+    if (!has_z) {
+      RCLCPP_WARN_ONCE(
+        this->get_logger(),
+        "PointCloud2 input has no z field. using z=0.0 for output clouds");
+    }
+
+    sensor_msgs::PointCloud2ConstIterator<float> iter_x(cloud, "x");
+    sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
+
+    if (has_z) {
+      sensor_msgs::PointCloud2ConstIterator<float> iter_z(cloud, "z");
+
+      for (size_t source_index = 0; iter_x != iter_x.end();
+        ++iter_x, ++iter_y, ++iter_z, ++source_index)
+      {
+        ScanPoint point;
+        if (makePointCloudScanPoint(*iter_x, *iter_y, *iter_z, source_index, point)) {
+          points.push_back(point);
+        }
+      }
+    } else {
+      for (size_t source_index = 0; iter_x != iter_x.end();
+        ++iter_x, ++iter_y, ++source_index)
+      {
+        ScanPoint point;
+        if (makePointCloudScanPoint(*iter_x, *iter_y, 0.0, source_index, point)) {
+          points.push_back(point);
+        }
+      }
+    }
+
+    std::sort(
+      points.begin(),
+      points.end(),
+      [](const ScanPoint & lhs, const ScanPoint & rhs) {
+        if (lhs.angle == rhs.angle) {
+          return lhs.range < rhs.range;
+        }
+        return lhs.angle < rhs.angle;
+      });
+
+    for (size_t i = 0; i < points.size(); ++i) {
+      points[i].index = i;
+    }
+
+    return points;
+  }
+
+  bool makePointCloudScanPoint(
+    double x,
+    double y,
+    double z,
+    size_t source_index,
+    ScanPoint & point) const
+  {
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      return false;
+    }
+
+    const double range = std::hypot(x, y);
+    if (range < min_valid_range_ || range > max_valid_range_) {
+      return false;
+    }
+
+    const double angle = std::atan2(y, x);
+    if (use_roi_filter_) {
+      if (angle < roi_angle_min_rad_ || angle > roi_angle_max_rad_) {
+        return false;
+      }
+    }
+
+    point.index = source_index;
+    point.source_index = source_index;
+    point.range = range;
+    point.angle = angle;
+    point.x = x;
+    point.y = y;
+    point.z = z;
+
+    return true;
+  }
+
+  double estimateAngleIncrement(const std::vector<ScanPoint> & points) const
+  {
+    if (points.size() < 2) {
+      return 0.0;
+    }
+
+    double sum_increment = 0.0;
+    int count = 0;
+
+    for (size_t i = 1; i < points.size(); ++i) {
+      const double increment = points[i].angle - points[i - 1].angle;
+      if (std::isfinite(increment) && increment > 1e-9) {
+        sum_increment += increment;
+        count++;
+      }
+    }
+
+    if (count == 0) {
+      return 0.0;
+    }
+
+    return sum_increment / static_cast<double>(count);
+  }
+
+  bool hasPointCloudField(
+    const sensor_msgs::msg::PointCloud2 & cloud,
+    const std::string & field_name) const
+  {
+    for (const auto & field : cloud.fields) {
+      if (field.name == field_name) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  size_t pointCloudPointCount(const sensor_msgs::msg::PointCloud2 & cloud) const
+  {
+    return static_cast<size_t>(cloud.width) * static_cast<size_t>(cloud.height);
   }
 
   bool isValidRange(
@@ -648,6 +860,86 @@ private:
     msg.risk_weight = 1.2f;
 
     return msg;
+  }
+
+  void publishSegmentedPointClouds(
+    const std_msgs::msg::Header & header,
+    const std::vector<ScanPoint> & points,
+    const std::vector<std::vector<ScanPoint>> & valid_clusters,
+    const obstacle_context_msgs::msg::ObstacleClusterArray & clusters_msg,
+    size_t source_point_count) const
+  {
+    using obstacle_context_msgs::msg::ObstacleCluster;
+
+    size_t mask_size = source_point_count;
+    for (const auto & point : points) {
+      mask_size = std::max(mask_size, point.source_index + 1);
+    }
+
+    std::vector<bool> dynamic_source_mask(mask_size, false);
+    const size_t cluster_count = std::min(valid_clusters.size(), clusters_msg.clusters.size());
+
+    for (size_t i = 0; i < cluster_count; ++i) {
+      if (clusters_msg.clusters[i].motion_label != ObstacleCluster::DYNAMIC) {
+        continue;
+      }
+
+      for (const auto & point : valid_clusters[i]) {
+        if (point.source_index < dynamic_source_mask.size()) {
+          dynamic_source_mask[point.source_index] = true;
+        }
+      }
+    }
+
+    std::vector<ScanPoint> dynamic_points;
+    std::vector<ScanPoint> static_points;
+    dynamic_points.reserve(points.size());
+    static_points.reserve(points.size());
+
+    for (const auto & point : points) {
+      const bool is_dynamic =
+        point.source_index < dynamic_source_mask.size() &&
+        dynamic_source_mask[point.source_index];
+
+      if (is_dynamic) {
+        dynamic_points.push_back(point);
+      } else {
+        static_points.push_back(point);
+      }
+    }
+
+    dynamic_pointcloud_pub_->publish(makePointCloudMsg(header, dynamic_points));
+    static_pointcloud_pub_->publish(makePointCloudMsg(header, static_points));
+  }
+
+  sensor_msgs::msg::PointCloud2 makePointCloudMsg(
+    const std_msgs::msg::Header & header,
+    const std::vector<ScanPoint> & points) const
+  {
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header = header;
+    cloud.height = 1;
+    cloud.is_bigendian = false;
+    cloud.is_dense = true;
+
+    sensor_msgs::PointCloud2Modifier modifier(cloud);
+    modifier.setPointCloud2FieldsByString(1, "xyz");
+    modifier.resize(points.size());
+
+    sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+
+    for (const auto & point : points) {
+      *iter_x = static_cast<float>(point.x);
+      *iter_y = static_cast<float>(point.y);
+      *iter_z = static_cast<float>(point.z);
+      ++iter_x;
+      ++iter_y;
+      ++iter_z;
+    }
+
+    return cloud;
   }
 
   void updateTracks(
@@ -1544,13 +1836,17 @@ private:
   }
 
 private:
+  std::string input_type_;
   std::string scan_topic_;
+  std::string pointcloud_topic_;
   std::string odom_topic_;
   std::string imu_topic_;
 
   std::string processed_scan_topic_;
   std::string output_topic_;
   std::string marker_topic_;
+  std::string dynamic_pointcloud_topic_;
+  std::string static_pointcloud_topic_;
 
   double min_valid_range_;
   double max_valid_range_;
@@ -1615,12 +1911,15 @@ private:
   uint32_t next_track_id_ = 1;
 
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
 
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr processed_scan_pub_;
   rclcpp::Publisher<obstacle_context_msgs::msg::ObstacleClusterArray>::SharedPtr cluster_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr dynamic_pointcloud_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr static_pointcloud_pub_;
 };
 
 int main(int argc, char ** argv)

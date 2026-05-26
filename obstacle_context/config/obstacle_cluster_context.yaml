@@ -1,12 +1,16 @@
 obstacle_cluster_context_node:
   ros__parameters:
+    input_type: "laser_scan"
     scan_topic: "/scan"
+    pointcloud_topic: "/cloud"
     odom_topic: "/odom"
     imu_topic: "/imu/data"
 
     processed_scan_topic: "/processed_scan"
     output_topic: "/obstacle_clusters"
     marker_topic: "/obstacle_cluster_markers"
+    dynamic_pointcloud_topic: "/dynamic_pointcloud"
+    static_pointcloud_topic: "/static_pointcloud"
 
     # scan preprocessing
     min_valid_range: 0.15

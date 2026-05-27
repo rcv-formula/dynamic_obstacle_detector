@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <deque>
 #include <iomanip>
@@ -93,6 +94,12 @@ public:
         static_pointcloud_topic_,
         rclcpp::SensorDataQoS());
 
+    if (sync_pointcloud_with_odom_) {
+      pointcloud_sync_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(10),
+        std::bind(&ObstacleClusterContextNode::tryProcessPendingPointClouds, this));
+    }
+
     RCLCPP_INFO(this->get_logger(), "obstacle_cluster_context_node started");
     RCLCPP_INFO(this->get_logger(), "use_sim_time: %s", use_sim_time_ ? "true" : "false");
     RCLCPP_INFO(this->get_logger(), "input_type: %s", input_type_.c_str());
@@ -112,8 +119,17 @@ public:
     RCLCPP_INFO(this->get_logger(), "obstacle_mode_topic: %s", obstacle_mode_topic_.c_str());
     RCLCPP_INFO(
       this->get_logger(),
+      "sync_pointcloud_with_odom: %s",
+      sync_pointcloud_with_odom_ ? "true" : "false");
+    RCLCPP_INFO(
+      this->get_logger(),
       "pointcloud_use_latest_tf: %s",
       pointcloud_use_latest_tf_ ? "true" : "false");
+  }
+
+  ~ObstacleClusterContextNode() override
+  {
+    logFinalLatencyStats();
   }
 
 private:
@@ -194,6 +210,110 @@ private:
     DynamicPointMetadata metadata;
   };
 
+  enum class OdomLookupStatus
+  {
+    NO_ODOM,
+    INTERPOLATED,
+    FALLBACK
+  };
+
+  struct OdomLookupResult
+  {
+    OdomLookupStatus status = OdomLookupStatus::NO_ODOM;
+    OdomPose pose;
+    double odom_error_sec = std::numeric_limits<double>::infinity();
+  };
+
+  struct PendingPointCloudFrame
+  {
+    std_msgs::msg::Header header;
+    std::vector<ScanPoint> points;
+    double angle_increment = 0.0;
+    size_t source_point_count = 0;
+    rclcpp::Time receive_time;
+  };
+
+  struct PointCloudLatencyContext
+  {
+    rclcpp::Time receive_time;
+    rclcpp::Time process_time;
+  };
+
+  struct LatencySample
+  {
+    double wait_ms = 0.0;
+    double cloud_age_ms = 0.0;
+    double odom_error_ms = std::numeric_limits<double>::quiet_NaN();
+  };
+
+  struct ScalarStats
+  {
+    bool has_samples = false;
+    double avg = 0.0;
+    double min = 0.0;
+    double max = 0.0;
+    double stddev = 0.0;
+  };
+
+  struct LatencyStats
+  {
+    ScalarStats wait_ms;
+    ScalarStats cloud_age_ms;
+    ScalarStats odom_error_ms;
+  };
+
+  struct RunningScalarStats
+  {
+    size_t count = 0;
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    double min = 0.0;
+    double max = 0.0;
+
+    void add(double value)
+    {
+      if (!std::isfinite(value)) {
+        return;
+      }
+
+      if (count == 0) {
+        min = value;
+        max = value;
+      } else {
+        min = std::min(min, value);
+        max = std::max(max, value);
+      }
+
+      sum += value;
+      sum_sq += value * value;
+      count++;
+    }
+
+    ScalarStats toScalarStats() const
+    {
+      ScalarStats stats;
+      if (count == 0) {
+        return stats;
+      }
+
+      stats.has_samples = true;
+      stats.avg = sum / static_cast<double>(count);
+      stats.min = min;
+      stats.max = max;
+      const double variance =
+        std::max(0.0, sum_sq / static_cast<double>(count) - stats.avg * stats.avg);
+      stats.stddev = std::sqrt(variance);
+      return stats;
+    }
+  };
+
+  struct RunningLatencyStats
+  {
+    RunningScalarStats wait_ms;
+    RunningScalarStats cloud_age_ms;
+    RunningScalarStats odom_error_ms;
+  };
+
   using DensityCell = std::pair<int, int>;
   using DensityGrid = std::map<DensityCell, double>;
 
@@ -216,6 +336,10 @@ private:
     this->declare_parameter<std::string>("static_pointcloud_topic", "/static_pointcloud");
     this->declare_parameter<std::string>("obstacle_mode_topic", "/obstacle_mode");
     this->declare_parameter<bool>("pointcloud_use_latest_tf", true);
+    this->declare_parameter<bool>("sync_pointcloud_with_odom", false);
+    this->declare_parameter<double>("pointcloud_odom_sync_timeout_sec", 0.06);
+    this->declare_parameter<int>("pointcloud_odom_sync_queue_size", 10);
+    this->declare_parameter<int>("latency_stats_window_size", 100);
 
     this->declare_parameter<double>("min_valid_range", 0.15);
     this->declare_parameter<double>("max_valid_range", 10.0);
@@ -288,6 +412,14 @@ private:
     obstacle_mode_topic_ = this->get_parameter("obstacle_mode_topic").as_string();
     pointcloud_use_latest_tf_ =
       this->get_parameter("pointcloud_use_latest_tf").as_bool();
+    sync_pointcloud_with_odom_ =
+      this->get_parameter("sync_pointcloud_with_odom").as_bool();
+    pointcloud_odom_sync_timeout_sec_ =
+      this->get_parameter("pointcloud_odom_sync_timeout_sec").as_double();
+    pointcloud_odom_sync_queue_size_ =
+      this->get_parameter("pointcloud_odom_sync_queue_size").as_int();
+    latency_stats_window_size_ =
+      this->get_parameter("latency_stats_window_size").as_int();
 
     if (input_type_ != "laser_scan" && input_type_ != "pointcloud2") {
       RCLCPP_WARN(
@@ -396,6 +528,18 @@ private:
     if (scan_density_cluster_min_dense_points_ < 1) {
       scan_density_cluster_min_dense_points_ = 1;
     }
+
+    if (pointcloud_odom_sync_timeout_sec_ < 0.0) {
+      pointcloud_odom_sync_timeout_sec_ = 0.0;
+    }
+
+    if (pointcloud_odom_sync_queue_size_ < 1) {
+      pointcloud_odom_sync_queue_size_ = 1;
+    }
+
+    if (latency_stats_window_size_ < 1) {
+      latency_stats_window_size_ = 1;
+    }
   }
 
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -446,6 +590,8 @@ private:
         break;
       }
     }
+
+    tryProcessPendingPointClouds();
   }
 
   void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan)
@@ -463,22 +609,230 @@ private:
 
   void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr cloud)
   {
+    const rclcpp::Time receive_time = this->get_clock()->now();
     const std::vector<ScanPoint> points = pointCloudToPoints(*cloud);
-    processPoints(
-      cloud->header,
-      points,
-      estimateAngleIncrement(points),
-      pointCloudPointCount(*cloud));
+
+    PendingPointCloudFrame frame;
+    frame.header = cloud->header;
+    frame.points = points;
+    frame.angle_increment = estimateAngleIncrement(points);
+    frame.source_point_count = pointCloudPointCount(*cloud);
+    frame.receive_time = receive_time;
+
+    if (!sync_pointcloud_with_odom_) {
+      processPointCloudFrame(frame);
+      return;
+    }
+
+    pending_pointclouds_.push_back(std::move(frame));
+
+    while (static_cast<int>(pending_pointclouds_.size()) > pointcloud_odom_sync_queue_size_) {
+      PendingPointCloudFrame oldest_frame = std::move(pending_pointclouds_.front());
+      pending_pointclouds_.pop_front();
+      processPointCloudFrame(oldest_frame);
+    }
+
+    tryProcessPendingPointClouds();
   }
 
-  void processPoints(
+  void processPointCloudFrame(const PendingPointCloudFrame & frame)
+  {
+    PointCloudLatencyContext latency_context;
+    latency_context.receive_time = frame.receive_time;
+    latency_context.process_time = this->get_clock()->now();
+
+    processPoints(
+      frame.header,
+      frame.points,
+      frame.angle_increment,
+      frame.source_point_count,
+      &latency_context);
+  }
+
+  void tryProcessPendingPointClouds()
+  {
+    if (!sync_pointcloud_with_odom_) {
+      return;
+    }
+
+    while (!pending_pointclouds_.empty()) {
+      const PendingPointCloudFrame & frame = pending_pointclouds_.front();
+      const rclcpp::Time now = this->get_clock()->now();
+      const rclcpp::Time cloud_time(frame.header.stamp);
+      const double wait_sec = std::max(0.0, (now - frame.receive_time).seconds());
+      const bool has_bracketed_odom = hasBracketedOdom(cloud_time);
+      const bool timed_out = wait_sec >= pointcloud_odom_sync_timeout_sec_;
+
+      if (!has_bracketed_odom && !timed_out) {
+        break;
+      }
+
+      PendingPointCloudFrame ready_frame = std::move(pending_pointclouds_.front());
+      pending_pointclouds_.pop_front();
+      processPointCloudFrame(ready_frame);
+    }
+  }
+
+  void recordPointCloudLatency(
+    const std_msgs::msg::Header & header,
+    const PointCloudLatencyContext & latency_context,
+    const OdomLookupResult & odom_lookup)
+  {
+    const rclcpp::Time cloud_time(header.stamp);
+
+    LatencySample sample;
+    sample.wait_ms =
+      std::max(0.0, (latency_context.process_time - latency_context.receive_time).seconds()) *
+      1000.0;
+    sample.cloud_age_ms =
+      (latency_context.process_time - cloud_time).seconds() * 1000.0;
+
+    if (std::isfinite(odom_lookup.odom_error_sec)) {
+      sample.odom_error_ms = std::fabs(odom_lookup.odom_error_sec) * 1000.0;
+    }
+
+    latency_samples_.push_back(sample);
+    while (static_cast<int>(latency_samples_.size()) > latency_stats_window_size_) {
+      latency_samples_.pop_front();
+    }
+
+    total_latency_sample_count_++;
+    total_latency_stats_.wait_ms.add(sample.wait_ms);
+    total_latency_stats_.cloud_age_ms.add(sample.cloud_age_ms);
+    total_latency_stats_.odom_error_ms.add(sample.odom_error_ms);
+
+    last_pointcloud_odom_status_ = odom_lookup.status;
+  }
+
+  LatencyStats computeLatencyStats() const
+  {
+    LatencyStats stats;
+    stats.wait_ms = computeScalarStats(
+      [](const LatencySample & sample) {return sample.wait_ms;});
+    stats.cloud_age_ms = computeScalarStats(
+      [](const LatencySample & sample) {return sample.cloud_age_ms;});
+    stats.odom_error_ms = computeScalarStats(
+      [](const LatencySample & sample) {return sample.odom_error_ms;});
+    return stats;
+  }
+
+  template<typename ValueFn>
+  ScalarStats computeScalarStats(ValueFn value_fn) const
+  {
+    ScalarStats stats;
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    int count = 0;
+
+    for (const auto & sample : latency_samples_) {
+      const double value = value_fn(sample);
+      if (!std::isfinite(value)) {
+        continue;
+      }
+
+      if (!stats.has_samples) {
+        stats.min = value;
+        stats.max = value;
+        stats.has_samples = true;
+      } else {
+        stats.min = std::min(stats.min, value);
+        stats.max = std::max(stats.max, value);
+      }
+
+      sum += value;
+      sum_sq += value * value;
+      count++;
+    }
+
+    if (count == 0) {
+      stats.has_samples = false;
+      return stats;
+    }
+
+    stats.avg = sum / static_cast<double>(count);
+    const double variance =
+      std::max(0.0, sum_sq / static_cast<double>(count) - stats.avg * stats.avg);
+    stats.stddev = std::sqrt(variance);
+
+    return stats;
+  }
+
+  std::string formatScalarStats(const ScalarStats & stats) const
+  {
+    if (!stats.has_samples) {
+      return "n/a";
+    }
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1)
+        << stats.avg << "/" << stats.min << "/"
+        << stats.max << "/" << stats.stddev;
+    return out.str();
+  }
+
+  LatencyStats computeTotalLatencyStats() const
+  {
+    LatencyStats stats;
+    stats.wait_ms = total_latency_stats_.wait_ms.toScalarStats();
+    stats.cloud_age_ms = total_latency_stats_.cloud_age_ms.toScalarStats();
+    stats.odom_error_ms = total_latency_stats_.odom_error_ms.toScalarStats();
+    return stats;
+  }
+
+  std::string formatFinalScalarStats(const ScalarStats & stats) const
+  {
+    if (!stats.has_samples) {
+      return "n/a";
+    }
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1)
+        << "best=" << stats.min
+        << " worst=" << stats.max
+        << " avg=" << stats.avg
+        << " std=" << stats.stddev;
+    return out.str();
+  }
+
+  void logFinalLatencyStats() const
+  {
+    if (total_latency_sample_count_ == 0) {
+      return;
+    }
+
+    const LatencyStats stats = computeTotalLatencyStats();
+    const std::string wait_stats = formatFinalScalarStats(stats.wait_ms);
+    const std::string cloud_age_stats = formatFinalScalarStats(stats.cloud_age_ms);
+    const std::string odom_error_stats = formatFinalScalarStats(stats.odom_error_ms);
+
+    RCLCPP_INFO(
+      this->get_logger(),
+      "final pointcloud latency stats samples=%zu sync=%s pending=%zu\n"
+      "  wait_ms %s\n"
+      "  cloud_age_ms %s\n"
+      "  odom_error_ms %s",
+      total_latency_sample_count_,
+      sync_pointcloud_with_odom_ ? "on" : "off",
+      pending_pointclouds_.size(),
+      wait_stats.c_str(),
+      cloud_age_stats.c_str(),
+      odom_error_stats.c_str());
+  }
+
+  OdomLookupResult processPoints(
     const std_msgs::msg::Header & header,
     const std::vector<ScanPoint> & points,
     double angle_increment,
-    size_t source_point_count)
+    size_t source_point_count,
+    const PointCloudLatencyContext * latency_context = nullptr)
   {
-    OdomPose curr_pose;
-    const bool has_odom = getInterpolatedOdom(header.stamp, curr_pose);
+    const OdomLookupResult odom_lookup = lookupOdom(header.stamp, true);
+    OdomPose curr_pose = odom_lookup.pose;
+    const bool has_odom = odom_lookup.status != OdomLookupStatus::NO_ODOM;
+
+    if (latency_context != nullptr) {
+      recordPointCloudLatency(header, *latency_context, odom_lookup);
+    }
 
     if (!has_odom) {
       RCLCPP_WARN_THROTTLE(
@@ -532,6 +886,8 @@ private:
     marker_pub_->publish(marker_array);
 
     publishSegmentedPointClouds(header, points, valid_clusters, out, source_point_count);
+
+    return odom_lookup;
   }
 
   void obstacleModeCallback(const std_msgs::msg::Int32::SharedPtr msg)
@@ -1719,39 +2075,70 @@ private:
     return {cx, cy};
   }
 
-  bool getInterpolatedOdom(
-    const rclcpp::Time & target_time,
-    OdomPose & out_pose) const
+  bool hasBracketedOdom(const rclcpp::Time & target_time) const
   {
-    if (odom_history_.empty()) {
+    if (odom_history_.size() < 2) {
       return false;
+    }
+
+    if (target_time < odom_history_.front().stamp ||
+      target_time > odom_history_.back().stamp)
+    {
+      return false;
+    }
+
+    for (size_t i = 1; i < odom_history_.size(); ++i) {
+      const auto & p0 = odom_history_[i - 1];
+      const auto & p1 = odom_history_[i];
+
+      if (p0.stamp <= target_time && target_time <= p1.stamp) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  OdomLookupResult lookupOdom(
+    const rclcpp::Time & target_time,
+    bool allow_fallback) const
+  {
+    OdomLookupResult result;
+
+    if (odom_history_.empty()) {
+      return result;
     }
 
     if (odom_history_.size() == 1) {
-      const double age = std::fabs((target_time - odom_history_.front().stamp).seconds());
+      const double age = (target_time - odom_history_.front().stamp).seconds();
 
-      if (age <= max_odom_age_sec_) {
-        out_pose = odom_history_.front();
-        return true;
+      if (allow_fallback && std::fabs(age) <= max_odom_age_sec_) {
+        result.pose = odom_history_.front();
+        result.pose.stamp = target_time;
+        result.status = OdomLookupStatus::FALLBACK;
+        result.odom_error_sec = age;
+        return result;
       }
 
-      return false;
+      return result;
     }
 
     if (target_time < odom_history_.front().stamp) {
-      return false;
+      return result;
     }
 
     if (target_time > odom_history_.back().stamp) {
       const double age = (target_time - odom_history_.back().stamp).seconds();
 
-      if (age <= max_odom_age_sec_) {
-        out_pose = odom_history_.back();
-        out_pose.stamp = target_time;
-        return true;
+      if (allow_fallback && age <= max_odom_age_sec_) {
+        result.pose = odom_history_.back();
+        result.pose.stamp = target_time;
+        result.status = OdomLookupStatus::FALLBACK;
+        result.odom_error_sec = age;
+        return result;
       }
 
-      return false;
+      return result;
     }
 
     for (size_t i = 1; i < odom_history_.size(); ++i) {
@@ -1762,23 +2149,40 @@ private:
         const double total_dt = (p1.stamp - p0.stamp).seconds();
 
         if (total_dt < 1e-6) {
-          out_pose = p1;
-          out_pose.stamp = target_time;
-          return true;
+          result.pose = p1;
+          result.pose.stamp = target_time;
+          result.status = OdomLookupStatus::INTERPOLATED;
+          result.odom_error_sec = 0.0;
+          return result;
         }
 
         const double ratio = (target_time - p0.stamp).seconds() / total_dt;
 
-        out_pose.stamp = target_time;
-        out_pose.x = p0.x + ratio * (p1.x - p0.x);
-        out_pose.y = p0.y + ratio * (p1.y - p0.y);
-        out_pose.yaw = interpolateYaw(p0.yaw, p1.yaw, ratio);
+        result.pose.stamp = target_time;
+        result.pose.x = p0.x + ratio * (p1.x - p0.x);
+        result.pose.y = p0.y + ratio * (p1.y - p0.y);
+        result.pose.yaw = interpolateYaw(p0.yaw, p1.yaw, ratio);
+        result.status = OdomLookupStatus::INTERPOLATED;
+        result.odom_error_sec = 0.0;
 
-        return true;
+        return result;
       }
     }
 
-    return false;
+    return result;
+  }
+
+  bool getInterpolatedOdom(
+    const rclcpp::Time & target_time,
+    OdomPose & out_pose) const
+  {
+    const OdomLookupResult result = lookupOdom(target_time, true);
+    if (result.status == OdomLookupStatus::NO_ODOM) {
+      return false;
+    }
+
+    out_pose = result.pose;
+    return true;
   }
 
   visualization_msgs::msg::MarkerArray makeMarkerArray(
@@ -1825,6 +2229,8 @@ private:
       gate_marker.color.b = ego_motion_unstable ? 0.0f : 1.0f;
       gate_marker.color.a = 1.0f;
 
+      const LatencyStats latency_stats = computeLatencyStats();
+
       std::ostringstream gate_text;
       gate_text << "ODOM TIME MODE\n"
                 << "obstacle mode: " << obstacle_mode_
@@ -1832,7 +2238,16 @@ private:
                 << "ego_v: " << std::fixed << std::setprecision(2)
                 << current_ego_speed_ << " m/s\n"
                 << "thr S/D: " << static_speed_threshold_ << " / "
-                << dynamic_speed_threshold_ << " m/s";
+                << dynamic_speed_threshold_ << " m/s\n"
+                << "sync: " << (sync_pointcloud_with_odom_ ? "on" : "off")
+                << " pending: " << pending_pointclouds_.size() << "\n"
+                << "odom: " << odomLookupStatusText(last_pointcloud_odom_status_) << "\n"
+                << "wait ms avg/min/max/std: "
+                << formatScalarStats(latency_stats.wait_ms) << "\n"
+                << "cloud age ms avg/min/max/std: "
+                << formatScalarStats(latency_stats.cloud_age_ms) << "\n"
+                << "odom err ms avg/min/max/std: "
+                << formatScalarStats(latency_stats.odom_error_ms);
 
       if (use_imu_motion_gate_) {
         gate_text << "\n"
@@ -2011,6 +2426,19 @@ private:
     return "STATIC_DYNAMIC";
   }
 
+  std::string odomLookupStatusText(OdomLookupStatus status) const
+  {
+    if (status == OdomLookupStatus::INTERPOLATED) {
+      return "interp";
+    }
+
+    if (status == OdomLookupStatus::FALLBACK) {
+      return "fallback";
+    }
+
+    return "no_odom";
+  }
+
   double normalizeAngle(double a) const
   {
     while (a > M_PI) {
@@ -2051,6 +2479,10 @@ private:
   std::string static_pointcloud_topic_;
   std::string obstacle_mode_topic_;
   bool pointcloud_use_latest_tf_;
+  bool sync_pointcloud_with_odom_;
+  double pointcloud_odom_sync_timeout_sec_;
+  int pointcloud_odom_sync_queue_size_;
+  int latency_stats_window_size_;
   int obstacle_mode_ = OBSTACLE_MODE_STATIC_AND_DYNAMIC;
 
   double min_valid_range_;
@@ -2102,6 +2534,11 @@ private:
 
   std::deque<OdomPose> odom_history_;
   std::deque<ScanFrame> scan_density_history_;
+  std::deque<PendingPointCloudFrame> pending_pointclouds_;
+  std::deque<LatencySample> latency_samples_;
+  RunningLatencyStats total_latency_stats_;
+  size_t total_latency_sample_count_ = 0;
+  OdomLookupStatus last_pointcloud_odom_status_ = OdomLookupStatus::NO_ODOM;
   double current_ego_speed_ = 0.0;
 
   bool has_imu_motion_spike_ = false;
@@ -2120,6 +2557,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr obstacle_mode_sub_;
+  rclcpp::TimerBase::SharedPtr pointcloud_sync_timer_;
 
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr processed_scan_pub_;
   rclcpp::Publisher<obstacle_context_msgs::msg::ObstacleClusterArray>::SharedPtr cluster_pub_;

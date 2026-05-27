@@ -15,6 +15,10 @@ obstacle_cluster_context_node:
     static_pointcloud_topic: "/static_pointcloud"
     obstacle_mode_topic: "/obstacle_mode"
     pointcloud_use_latest_tf: true
+    sync_pointcloud_with_odom: false
+    pointcloud_odom_sync_timeout_sec: 0.06
+    pointcloud_odom_sync_queue_size: 10
+    latency_stats_window_size: 100
 
     # scan preprocessing
     min_valid_range: 0.15

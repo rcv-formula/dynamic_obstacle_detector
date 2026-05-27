@@ -19,6 +19,7 @@
 #include "sensor_msgs/msg/imu.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "std_msgs/msg/header.hpp"
+#include "std_msgs/msg/int32.hpp"
 
 #include "visualization_msgs/msg/marker.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
@@ -62,6 +63,11 @@ public:
         std::bind(&ObstacleClusterContextNode::imuCallback, this, std::placeholders::_1));
     }
 
+    obstacle_mode_sub_ = this->create_subscription<std_msgs::msg::Int32>(
+      obstacle_mode_topic_,
+      rclcpp::QoS(10),
+      std::bind(&ObstacleClusterContextNode::obstacleModeCallback, this, std::placeholders::_1));
+
     processed_scan_pub_ =
       this->create_publisher<sensor_msgs::msg::LaserScan>(
         processed_scan_topic_,
@@ -103,6 +109,7 @@ public:
     RCLCPP_INFO(this->get_logger(), "marker_topic: %s", marker_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "dynamic_pointcloud_topic: %s", dynamic_pointcloud_topic_.c_str());
     RCLCPP_INFO(this->get_logger(), "static_pointcloud_topic: %s", static_pointcloud_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "obstacle_mode_topic: %s", obstacle_mode_topic_.c_str());
     RCLCPP_INFO(
       this->get_logger(),
       "pointcloud_use_latest_tf: %s",
@@ -190,6 +197,10 @@ private:
   using DensityCell = std::pair<int, int>;
   using DensityGrid = std::map<DensityCell, double>;
 
+  static constexpr int OBSTACLE_MODE_STATIC_ONLY = 1;
+  static constexpr int OBSTACLE_MODE_DYNAMIC_ONLY = 2;
+  static constexpr int OBSTACLE_MODE_STATIC_AND_DYNAMIC = 3;
+
   void declareParameters()
   {
     this->declare_parameter<std::string>("input_type", "laser_scan");
@@ -203,6 +214,7 @@ private:
     this->declare_parameter<std::string>("marker_topic", "/obstacle_cluster_markers");
     this->declare_parameter<std::string>("dynamic_pointcloud_topic", "/dynamic_pointcloud");
     this->declare_parameter<std::string>("static_pointcloud_topic", "/static_pointcloud");
+    this->declare_parameter<std::string>("obstacle_mode_topic", "/obstacle_mode");
     this->declare_parameter<bool>("pointcloud_use_latest_tf", true);
 
     this->declare_parameter<double>("min_valid_range", 0.15);
@@ -273,6 +285,7 @@ private:
       this->get_parameter("dynamic_pointcloud_topic").as_string();
     static_pointcloud_topic_ =
       this->get_parameter("static_pointcloud_topic").as_string();
+    obstacle_mode_topic_ = this->get_parameter("obstacle_mode_topic").as_string();
     pointcloud_use_latest_tf_ =
       this->get_parameter("pointcloud_use_latest_tf").as_bool();
 
@@ -511,12 +524,38 @@ private:
       removeOldTracks(header.stamp);
     }
 
+    applyObstacleMode(out);
+
     cluster_pub_->publish(out);
 
     auto marker_array = makeMarkerArray(out);
     marker_pub_->publish(marker_array);
 
     publishSegmentedPointClouds(header, points, valid_clusters, out, source_point_count);
+  }
+
+  void obstacleModeCallback(const std_msgs::msg::Int32::SharedPtr msg)
+  {
+    if (msg->data < OBSTACLE_MODE_STATIC_ONLY ||
+      msg->data > OBSTACLE_MODE_STATIC_AND_DYNAMIC)
+    {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        1000,
+        "invalid obstacle mode %d. use 1=static only, 2=dynamic only, 3=both",
+        msg->data);
+      return;
+    }
+
+    if (obstacle_mode_ != msg->data) {
+      obstacle_mode_ = msg->data;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "obstacle mode changed to %d (%s)",
+        obstacle_mode_,
+        obstacleModeText().c_str());
+    }
   }
 
   sensor_msgs::msg::LaserScan makeProcessedScan(
@@ -904,14 +943,12 @@ private:
     }
 
     std::vector<bool> dynamic_source_mask(mask_size, false);
+    std::vector<bool> static_source_mask(mask_size, false);
     std::vector<DynamicPointMetadata> dynamic_metadata(mask_size);
     const size_t cluster_count = std::min(valid_clusters.size(), clusters_msg.clusters.size());
 
     for (size_t i = 0; i < cluster_count; ++i) {
       const auto & cluster_msg = clusters_msg.clusters[i];
-      if (cluster_msg.motion_label != ObstacleCluster::DYNAMIC) {
-        continue;
-      }
 
       DynamicPointMetadata metadata;
       metadata.track_id = cluster_msg.track_id;
@@ -919,9 +956,17 @@ private:
       metadata.relative_yaw = std::atan2(cluster_msg.center_y, cluster_msg.center_x);
 
       for (const auto & point : valid_clusters[i]) {
-        if (point.source_index < dynamic_source_mask.size()) {
+        if (point.source_index >= dynamic_source_mask.size()) {
+          continue;
+        }
+
+        if (isDynamicOutputLabel(cluster_msg.motion_label)) {
           dynamic_source_mask[point.source_index] = true;
           dynamic_metadata[point.source_index] = metadata;
+        }
+
+        if (isStaticOutputLabel(cluster_msg.motion_label)) {
+          static_source_mask[point.source_index] = true;
         }
       }
     }
@@ -935,13 +980,16 @@ private:
       const bool is_dynamic =
         point.source_index < dynamic_source_mask.size() &&
         dynamic_source_mask[point.source_index];
+      const bool is_static =
+        point.source_index < static_source_mask.size() &&
+        static_source_mask[point.source_index];
 
       if (is_dynamic) {
         DynamicPoint dynamic_point;
         dynamic_point.point = point;
         dynamic_point.metadata = dynamic_metadata[point.source_index];
         dynamic_points.push_back(dynamic_point);
-      } else {
+      } else if (is_static) {
         static_points.push_back(point);
       }
     }
@@ -1563,6 +1611,51 @@ private:
     return 1.0f;
   }
 
+  void applyObstacleMode(
+    obstacle_context_msgs::msg::ObstacleClusterArray & clusters_msg) const
+  {
+    using obstacle_context_msgs::msg::ObstacleCluster;
+
+    if (obstacle_mode_ == OBSTACLE_MODE_STATIC_AND_DYNAMIC) {
+      return;
+    }
+
+    for (auto & cluster : clusters_msg.clusters) {
+      if (obstacle_mode_ == OBSTACLE_MODE_STATIC_ONLY) {
+        if (cluster.motion_label == ObstacleCluster::DYNAMIC) {
+          cluster.motion_label = ObstacleCluster::STATIC;
+        }
+      } else if (obstacle_mode_ == OBSTACLE_MODE_DYNAMIC_ONLY) {
+        if (cluster.motion_label == ObstacleCluster::STATIC) {
+          cluster.motion_label = ObstacleCluster::MOTION_UNKNOWN;
+        }
+      }
+
+      cluster.is_wall_static = cluster.motion_label == ObstacleCluster::WALL_STATIC;
+      cluster.risk_weight = decideRiskWeight(cluster.motion_label);
+    }
+  }
+
+  bool isDynamicOutputLabel(uint8_t motion_label) const
+  {
+    return motion_label == obstacle_context_msgs::msg::ObstacleCluster::DYNAMIC;
+  }
+
+  bool isStaticOutputLabel(uint8_t motion_label) const
+  {
+    using obstacle_context_msgs::msg::ObstacleCluster;
+
+    if (obstacle_mode_ == OBSTACLE_MODE_DYNAMIC_ONLY) {
+      return motion_label == ObstacleCluster::WALL_STATIC;
+    }
+
+    if (obstacle_mode_ == OBSTACLE_MODE_STATIC_ONLY) {
+      return motion_label != ObstacleCluster::DYNAMIC;
+    }
+
+    return motion_label != ObstacleCluster::DYNAMIC;
+  }
+
   void setAllClustersUnknown(
     obstacle_context_msgs::msg::ObstacleClusterArray & clusters_msg) const
   {
@@ -1734,6 +1827,8 @@ private:
 
       std::ostringstream gate_text;
       gate_text << "ODOM TIME MODE\n"
+                << "obstacle mode: " << obstacle_mode_
+                << " " << obstacleModeText() << "\n"
                 << "ego_v: " << std::fixed << std::setprecision(2)
                 << current_ego_speed_ << " m/s\n"
                 << "thr S/D: " << static_speed_threshold_ << " / "
@@ -1903,6 +1998,19 @@ private:
     return "UNKNOWN";
   }
 
+  std::string obstacleModeText() const
+  {
+    if (obstacle_mode_ == OBSTACLE_MODE_STATIC_ONLY) {
+      return "STATIC_ONLY";
+    }
+
+    if (obstacle_mode_ == OBSTACLE_MODE_DYNAMIC_ONLY) {
+      return "DYNAMIC_ONLY";
+    }
+
+    return "STATIC_DYNAMIC";
+  }
+
   double normalizeAngle(double a) const
   {
     while (a > M_PI) {
@@ -1941,7 +2049,9 @@ private:
   std::string marker_topic_;
   std::string dynamic_pointcloud_topic_;
   std::string static_pointcloud_topic_;
+  std::string obstacle_mode_topic_;
   bool pointcloud_use_latest_tf_;
+  int obstacle_mode_ = OBSTACLE_MODE_STATIC_AND_DYNAMIC;
 
   double min_valid_range_;
   double max_valid_range_;
@@ -2009,6 +2119,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr obstacle_mode_sub_;
 
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr processed_scan_pub_;
   rclcpp::Publisher<obstacle_context_msgs::msg::ObstacleClusterArray>::SharedPtr cluster_pub_;

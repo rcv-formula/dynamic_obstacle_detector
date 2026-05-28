@@ -119,6 +119,12 @@ public:
     RCLCPP_INFO(this->get_logger(), "obstacle_mode_topic: %s", obstacle_mode_topic_.c_str());
     RCLCPP_INFO(
       this->get_logger(),
+      "dynamic_pointcloud_lpf: %s speed_alpha: %.2f yaw_alpha: %.2f",
+      use_dynamic_pointcloud_lpf_ ? "true" : "false",
+      dynamic_pointcloud_speed_lpf_alpha_,
+      dynamic_pointcloud_yaw_lpf_alpha_);
+    RCLCPP_INFO(
+      this->get_logger(),
       "sync_pointcloud_with_odom: %s",
       sync_pointcloud_with_odom_ ? "true" : "false");
     RCLCPP_INFO(
@@ -175,6 +181,10 @@ private:
     double vy;
     double speed;
     double compensated_displacement;
+
+    bool dynamic_pointcloud_lpf_initialized;
+    double dynamic_pointcloud_filtered_speed;
+    double dynamic_pointcloud_filtered_abs_yaw;
 
     uint8_t motion_label;
     int static_hit_count;
@@ -335,6 +345,9 @@ private:
     this->declare_parameter<std::string>("dynamic_pointcloud_topic", "/dynamic_pointcloud");
     this->declare_parameter<std::string>("static_pointcloud_topic", "/static_pointcloud");
     this->declare_parameter<std::string>("obstacle_mode_topic", "/obstacle_mode");
+    this->declare_parameter<bool>("use_dynamic_pointcloud_lpf", true);
+    this->declare_parameter<double>("dynamic_pointcloud_speed_lpf_alpha", 0.5);
+    this->declare_parameter<double>("dynamic_pointcloud_yaw_lpf_alpha", 0.5);
     this->declare_parameter<bool>("pointcloud_use_latest_tf", true);
     this->declare_parameter<bool>("sync_pointcloud_with_odom", false);
     this->declare_parameter<double>("pointcloud_odom_sync_timeout_sec", 0.06);
@@ -410,6 +423,14 @@ private:
     static_pointcloud_topic_ =
       this->get_parameter("static_pointcloud_topic").as_string();
     obstacle_mode_topic_ = this->get_parameter("obstacle_mode_topic").as_string();
+    use_dynamic_pointcloud_lpf_ =
+      this->get_parameter("use_dynamic_pointcloud_lpf").as_bool();
+    dynamic_pointcloud_speed_lpf_alpha_ = clampUnitInterval(
+      this->get_parameter("dynamic_pointcloud_speed_lpf_alpha").as_double(),
+      0.5);
+    dynamic_pointcloud_yaw_lpf_alpha_ = clampUnitInterval(
+      this->get_parameter("dynamic_pointcloud_yaw_lpf_alpha").as_double(),
+      0.5);
     pointcloud_use_latest_tf_ =
       this->get_parameter("pointcloud_use_latest_tf").as_bool();
     sync_pointcloud_with_odom_ =
@@ -885,7 +906,13 @@ private:
     auto marker_array = makeMarkerArray(out);
     marker_pub_->publish(marker_array);
 
-    publishSegmentedPointClouds(header, points, valid_clusters, out, source_point_count);
+    publishSegmentedPointClouds(
+      header,
+      points,
+      valid_clusters,
+      out,
+      source_point_count,
+      has_odom ? &curr_pose : nullptr);
 
     return odom_lookup;
   }
@@ -1289,10 +1316,9 @@ private:
     const std::vector<ScanPoint> & points,
     const std::vector<std::vector<ScanPoint>> & valid_clusters,
     const obstacle_context_msgs::msg::ObstacleClusterArray & clusters_msg,
-    size_t source_point_count) const
+    size_t source_point_count,
+    const OdomPose * curr_pose)
   {
-    using obstacle_context_msgs::msg::ObstacleCluster;
-
     size_t mask_size = source_point_count;
     for (const auto & point : points) {
       mask_size = std::max(mask_size, point.source_index + 1);
@@ -1306,17 +1332,18 @@ private:
     for (size_t i = 0; i < cluster_count; ++i) {
       const auto & cluster_msg = clusters_msg.clusters[i];
 
-      DynamicPointMetadata metadata;
-      metadata.track_id = cluster_msg.track_id;
-      metadata.relative_speed = cluster_msg.speed;
-      metadata.relative_yaw = std::atan2(cluster_msg.center_y, cluster_msg.center_x);
+      const bool dynamic_output = isDynamicOutputLabel(cluster_msg.motion_label);
+      DynamicPointMetadata metadata = makeDynamicPointMetadata(cluster_msg, curr_pose);
+      if (!dynamic_output) {
+        resetDynamicPointCloudLpf(cluster_msg.track_id);
+      }
 
       for (const auto & point : valid_clusters[i]) {
         if (point.source_index >= dynamic_source_mask.size()) {
           continue;
         }
 
-        if (isDynamicOutputLabel(cluster_msg.motion_label)) {
+        if (dynamic_output) {
           dynamic_source_mask[point.source_index] = true;
           dynamic_metadata[point.source_index] = metadata;
         }
@@ -1352,6 +1379,86 @@ private:
 
     dynamic_pointcloud_pub_->publish(makeDynamicPointCloudMsg(header, dynamic_points));
     static_pointcloud_pub_->publish(makePointCloudMsg(header, static_points));
+  }
+
+  DynamicPointMetadata makeDynamicPointMetadata(
+    const obstacle_context_msgs::msg::ObstacleCluster & cluster_msg,
+    const OdomPose * curr_pose)
+  {
+    DynamicPointMetadata metadata;
+    metadata.track_id = cluster_msg.track_id;
+    metadata.relative_speed = cluster_msg.speed;
+    metadata.relative_yaw = std::atan2(cluster_msg.center_y, cluster_msg.center_x);
+
+    if (!use_dynamic_pointcloud_lpf_ ||
+      curr_pose == nullptr ||
+      !isDynamicOutputLabel(cluster_msg.motion_label) ||
+      cluster_msg.track_id == 0)
+    {
+      return metadata;
+    }
+
+    Track * tr = findTrackById(cluster_msg.track_id);
+    if (tr == nullptr) {
+      return metadata;
+    }
+
+    const double raw_speed = static_cast<double>(metadata.relative_speed);
+    const double raw_relative_yaw = static_cast<double>(metadata.relative_yaw);
+
+    if (!std::isfinite(raw_speed) || !std::isfinite(raw_relative_yaw)) {
+      return metadata;
+    }
+
+    const double raw_abs_yaw = normalizeAngle(curr_pose->yaw + raw_relative_yaw);
+
+    if (!tr->dynamic_pointcloud_lpf_initialized) {
+      tr->dynamic_pointcloud_filtered_speed = raw_speed;
+      tr->dynamic_pointcloud_filtered_abs_yaw = raw_abs_yaw;
+      tr->dynamic_pointcloud_lpf_initialized = true;
+    } else {
+      tr->dynamic_pointcloud_filtered_speed =
+        lowPassScalar(
+          tr->dynamic_pointcloud_filtered_speed,
+          raw_speed,
+          dynamic_pointcloud_speed_lpf_alpha_);
+      tr->dynamic_pointcloud_filtered_abs_yaw =
+        lowPassAngle(
+          tr->dynamic_pointcloud_filtered_abs_yaw,
+          raw_abs_yaw,
+          dynamic_pointcloud_yaw_lpf_alpha_);
+    }
+
+    metadata.relative_speed =
+      static_cast<float>(tr->dynamic_pointcloud_filtered_speed);
+    metadata.relative_yaw =
+      static_cast<float>(
+        normalizeAngle(tr->dynamic_pointcloud_filtered_abs_yaw - curr_pose->yaw));
+
+    return metadata;
+  }
+
+  void resetDynamicPointCloudLpf(uint32_t track_id)
+  {
+    Track * tr = findTrackById(track_id);
+    if (tr == nullptr) {
+      return;
+    }
+
+    tr->dynamic_pointcloud_lpf_initialized = false;
+    tr->dynamic_pointcloud_filtered_speed = 0.0;
+    tr->dynamic_pointcloud_filtered_abs_yaw = 0.0;
+  }
+
+  Track * findTrackById(uint32_t track_id)
+  {
+    for (auto & tr : tracks_) {
+      if (tr.id == track_id) {
+        return &tr;
+      }
+    }
+
+    return nullptr;
   }
 
   sensor_msgs::msg::PointCloud2 makeDynamicPointCloudMsg(
@@ -1557,6 +1664,9 @@ private:
         tr.vy = 0.0;
         tr.speed = 0.0;
         tr.compensated_displacement = 0.0;
+        tr.dynamic_pointcloud_lpf_initialized = false;
+        tr.dynamic_pointcloud_filtered_speed = 0.0;
+        tr.dynamic_pointcloud_filtered_abs_yaw = 0.0;
         tr.motion_label = cluster.is_density_static ?
           refineWallStaticLabel(obstacle_context_msgs::msg::ObstacleCluster::STATIC, cluster) :
           obstacle_context_msgs::msg::ObstacleCluster::MOTION_UNKNOWN;
@@ -2458,6 +2568,25 @@ private:
     return normalizeAngle(yaw0 + ratio * diff);
   }
 
+  double lowPassScalar(double previous, double current, double alpha) const
+  {
+    return previous + alpha * (current - previous);
+  }
+
+  double lowPassAngle(double previous, double current, double alpha) const
+  {
+    return normalizeAngle(previous + alpha * normalizeAngle(current - previous));
+  }
+
+  double clampUnitInterval(double value, double fallback) const
+  {
+    if (!std::isfinite(value)) {
+      return fallback;
+    }
+
+    return std::max(0.0, std::min(1.0, value));
+  }
+
   double deg2rad(double deg) const
   {
     return deg * M_PI / 180.0;
@@ -2478,6 +2607,9 @@ private:
   std::string dynamic_pointcloud_topic_;
   std::string static_pointcloud_topic_;
   std::string obstacle_mode_topic_;
+  bool use_dynamic_pointcloud_lpf_;
+  double dynamic_pointcloud_speed_lpf_alpha_;
+  double dynamic_pointcloud_yaw_lpf_alpha_;
   bool pointcloud_use_latest_tf_;
   bool sync_pointcloud_with_odom_;
   double pointcloud_odom_sync_timeout_sec_;

@@ -433,7 +433,23 @@ Each point contains the following fields:
 | `y` | `float32` | Point y position in the current sensor frame. |
 | `z` | `float32` | Point z position. For LaserScan input, this is `0.0`. |
 | `track_id` | `uint32` | Tracker ID of the dynamic cluster that contains this point. |
-| `relative_speed` | `float32` | Odom-compensated speed of the dynamic cluster. |
-| `relative_yaw` | `float32` | Bearing angle from the robot to the cluster center, computed as `atan2(center_y, center_x)`. |
+| `relative_speed` | `float32` | Odom-compensated speed of the dynamic cluster. When enabled, the dynamic pointcloud LPF filters this scalar value before publishing. |
+| `relative_yaw` | `float32` | Bearing angle from the robot to the cluster center, computed as `atan2(center_y, center_x)`. When enabled, the dynamic pointcloud LPF filters the odom-based world bearing and converts it back to this relative bearing. |
 
 Points from the same dynamic cluster share the same `track_id`, `relative_speed`, and `relative_yaw`.
+
+Optional LPF parameters:
+
+```yaml
+use_dynamic_pointcloud_lpf: true
+dynamic_pointcloud_speed_lpf_alpha: 0.5
+dynamic_pointcloud_yaw_lpf_alpha: 0.5
+```
+
+The alpha values are the current-sample ratio:
+
+```text
+filtered = previous * (1 - alpha) + current * alpha
+```
+
+This LPF is applied only to `/dynamic_pointcloud` custom metadata fields. It does not change tracking, motion classification, `/obstacle_clusters`, RViz markers, or static/dynamic point selection.

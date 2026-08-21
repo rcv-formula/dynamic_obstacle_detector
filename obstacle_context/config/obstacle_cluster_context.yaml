@@ -30,6 +30,7 @@ obstacle_cluster_context_node:
     min_valid_range: 0.15
     max_valid_range: 10.0
 
+    use_scan_deskew: true
     use_roi_filter: true
     roi_angle_min_deg: -120.0
     roi_angle_max_deg: 120.0

@@ -145,6 +145,9 @@ private:
     double x;
     double y;
     double yaw;
+    double vx = 0.0;   // body-frame linear velocity
+    double vy = 0.0;
+    double wz = 0.0;   // yaw rate
   };
 
   struct ScanPoint
@@ -357,6 +360,7 @@ private:
     this->declare_parameter<double>("min_valid_range", 0.15);
     this->declare_parameter<double>("max_valid_range", 10.0);
 
+    this->declare_parameter<bool>("use_scan_deskew", true);
     this->declare_parameter<bool>("use_roi_filter", true);
     this->declare_parameter<double>("roi_angle_min_deg", -120.0);
     this->declare_parameter<double>("roi_angle_max_deg", 120.0);
@@ -453,6 +457,7 @@ private:
     min_valid_range_ = this->get_parameter("min_valid_range").as_double();
     max_valid_range_ = this->get_parameter("max_valid_range").as_double();
 
+    use_scan_deskew_ = this->get_parameter("use_scan_deskew").as_bool();
     use_roi_filter_ = this->get_parameter("use_roi_filter").as_bool();
     roi_angle_min_rad_ = deg2rad(this->get_parameter("roi_angle_min_deg").as_double());
     roi_angle_max_rad_ = deg2rad(this->get_parameter("roi_angle_max_deg").as_double());
@@ -578,6 +583,9 @@ private:
     pose.x = msg->pose.pose.position.x;
     pose.y = msg->pose.pose.position.y;
     pose.yaw = yawFromQuaternion(msg->pose.pose.orientation);
+    pose.vx = msg->twist.twist.linear.x;
+    pose.vy = msg->twist.twist.linear.y;
+    pose.wz = msg->twist.twist.angular.z;
 
     if (!odom_history_.empty()) {
       const OdomPose & prev = odom_history_.back();
@@ -986,6 +994,31 @@ private:
     std::vector<ScanPoint> points;
     points.reserve(scan.ranges.size());
 
+    // Motion deskew. Each beam is sampled at a different instant across the sweep
+    // (time_increment * index); at 6 m/s the vehicle covers ~15 cm during one 18.75 ms
+    // sweep, and without this the whole scan is treated as a single instant.
+    //
+    // The sweep runs FORWARD from the header stamp, so the pose at its end is still in
+    // the future and is not in odom_history_ when this callback runs. Looking it up
+    // silently clamps to the newest sample and the deskew becomes a no-op (measured on
+    // 0813: only 0.9% of clusters moved, by at most 2 mm). Extrapolate from the
+    // body-frame twist at the sweep start instead, which needs no future data.
+    const rclcpp::Time scan_stamp(scan.header.stamp);
+    const size_t beam_count = scan.ranges.size();
+    const double sweep_span =
+      (beam_count > 1) ? scan.time_increment * static_cast<double>(beam_count - 1) : 0.0;
+
+    bool deskew = false;
+    OdomPose sweep_begin;
+    if (use_scan_deskew_ && std::isfinite(scan.time_increment) && sweep_span > 1e-6) {
+      const OdomLookupResult a = lookupOdom(scan_stamp, true);
+      if (a.status != OdomLookupStatus::NO_ODOM) {
+        sweep_begin = a.pose;
+        deskew = std::isfinite(sweep_begin.vx) && std::isfinite(sweep_begin.vy) &&
+          std::isfinite(sweep_begin.wz);
+      }
+    }
+
     for (size_t i = 0; i < scan.ranges.size(); ++i) {
       const double range = scan.ranges[i];
 
@@ -1003,6 +1036,26 @@ private:
       p.x = range * std::cos(angle);
       p.y = range * std::sin(angle);
       p.z = 0.0;
+
+      if (deskew) {
+        const double dt = static_cast<double>(i) * scan.time_increment;
+        const double dx_body = sweep_begin.vx * dt;
+        const double dy_body = sweep_begin.vy * dt;
+
+        OdomPose beam_pose;
+        beam_pose.stamp = scan_stamp;
+        beam_pose.yaw = normalizeAngle(sweep_begin.yaw + sweep_begin.wz * dt);
+        beam_pose.x = sweep_begin.x +
+          std::cos(sweep_begin.yaw) * dx_body - std::sin(sweep_begin.yaw) * dy_body;
+        beam_pose.y = sweep_begin.y +
+          std::sin(sweep_begin.yaw) * dx_body + std::cos(sweep_begin.yaw) * dy_body;
+
+        const auto fixed = transformPrevPointToCurrentFrame(p.x, p.y, beam_pose, sweep_begin);
+        p.x = fixed.first;
+        p.y = fixed.second;
+        p.range = std::hypot(p.x, p.y);
+        p.angle = std::atan2(p.y, p.x);
+      }
 
       points.push_back(p);
     }
@@ -2620,6 +2673,7 @@ private:
   double min_valid_range_;
   double max_valid_range_;
 
+  bool use_scan_deskew_;
   bool use_roi_filter_;
   double roi_angle_min_rad_;
   double roi_angle_max_rad_;
